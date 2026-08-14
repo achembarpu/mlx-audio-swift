@@ -35,6 +35,14 @@ final class NemotronASRStreamRNNTState {
     var decoderState: NemoLSTMState?
     var globalTime = 0  // absolute subsampled-frame index, for token timestamps
 
+    // Greedy-decode accelerator: the prediction network's output is a pure
+    // function of (currentToken, decoderState). Between emissions neither
+    // changes, so a run of consecutive blanks can reuse the previous decode
+    // instead of recomputing it per frame (each blank frame cost one LSTM
+    // forward pass that changed nothing).
+    var cachedLastToken: Int?
+    var cachedPred: MLXArray?
+
     init(blankToken: Int) { lastToken = blankToken }
 }
 
@@ -55,12 +63,26 @@ extension NemotronASRModel {
             let currentToken: MLXArray? = state.lastToken == blankTokenID
                 ? nil
                 : MLXArray(Int32(state.lastToken)).reshaped([1, 1]).asType(.int32)
-            let decoderOutput = decoder(currentToken, state: state.decoderState)
-            let pred = decoderOutput.0.asType(frame.dtype)
-            let proposedState: NemoLSTMState = (
-                hidden: decoderOutput.1.hidden?.asType(frame.dtype),
-                cell: decoderOutput.1.cell?.asType(frame.dtype)
-            )
+
+            // Reuse the prediction output across consecutive unchanged frames.
+            let pred: MLXArray
+            let proposedState: NemoLSTMState
+            if state.cachedLastToken == state.lastToken, let cachedPred = state.cachedPred {
+                pred = cachedPred
+                proposedState = (
+                    hidden: state.decoderState?.hidden,
+                    cell: state.decoderState?.cell
+                )
+            } else {
+                let decoderOutput = decoder(currentToken, state: state.decoderState)
+                pred = decoderOutput.0.asType(frame.dtype)
+                proposedState = (
+                    hidden: decoderOutput.1.hidden?.asType(frame.dtype),
+                    cell: decoderOutput.1.cell?.asType(frame.dtype)
+                )
+                state.cachedPred = pred
+                state.cachedLastToken = state.lastToken
+            }
             let jointOutput = joint(frame, pred)
             let token = jointOutput.argMax(axis: -1).item(Int.self)
             let step = NemoDecodingLogic.rnntStep(
@@ -109,6 +131,20 @@ public final class NemotronASRStreamSession {
     private var emittedText = ""
     private var done = false
 
+    // Incremental mel state: the pre-emphasized signal grows with each `step`,
+    // and only newly-FROZEN mel frames (see `frozenFrameCount`) are computed and
+    // appended to `melAccum`. `finish()` recomputes the full mel once (covering
+    // padTo right-padding and the trailing partial window), so the streaming
+    // prefix and the final transcript stay bit-identical to
+    // `generateStream(wholeAudio)`.
+    private var preemphBuffer: [Float] = []
+    private var lastRawSample: Float = 0
+    private var hasPreemphContext = false
+    private var melAccum: MLXArray?
+    private var melComputedFrames = 0
+    private lazy var melWindow: MLXArray = NemotronASRAudio.melWindow(model.preprocessConfig)
+    private lazy var melFilters: MLXArray = NemotronASRAudio.melFilterbank(model.preprocessConfig)
+
     init(model: NemotronASRModel, language: String?, chunkFrames: Int?) {
         self.model = model
         self.language = language
@@ -144,6 +180,7 @@ public final class NemotronASRStreamSession {
     @discardableResult
     public func step(_ samples: [Float]) -> Delta {
         rawBuffer.append(contentsOf: samples)
+        appendPreemph(samples)
         return advance(final: false)
     }
 
@@ -167,21 +204,62 @@ public final class NemotronASRStreamSession {
             return Delta(text: "", tokenIds: [])
         }
 
-        let audio = MLXArray(rawBuffer)
-        let mel = NemotronASRAudio.logMelSpectrogram(audio, config: model.preprocessConfig)  // (1, T, F)
-        let totalMel = mel.shape[1]
-        let limit = final ? totalMel : frozenMelFrames(totalMel: totalMel)
-
+        let config = model.preprocessConfig
         let firstNew = rnntState.results.count
-        model.streamEncodeChunks(
-            mel,
-            language: language,
-            limit: limit,
-            chunkFrames: chunkFrames,
-            flushTail: final,
-            state: encState
-        ) { prompted in
-            model.streamRNNTDecode(prompted, state: rnntState, frameSeconds: frameSeconds)
+
+        if final {
+            // Tail flush: recompute the full mel exactly (covers padTo
+            // right-padding and the trailing partial window) and encode to the
+            // end. Frozen frames [0, melComputedFrames) equal the incremental
+            // ones, so the encoder state resumes identically.
+            let fullMel = NemotronASRAudio.logMelSpectrogram(MLXArray(rawBuffer), config: config)
+            let totalMel = fullMel.shape[1]
+            model.streamEncodeChunks(
+                fullMel,
+                language: language,
+                limit: totalMel,
+                chunkFrames: chunkFrames,
+                flushTail: true,
+                state: encState
+            ) { prompted in
+                model.streamRNNTDecode(prompted, state: rnntState, frameSeconds: frameSeconds)
+            }
+        } else {
+            // Incremental: compute only the newly-frozen frames and append them
+            // to the cached prefix, so the per-step cost is O(new frames) instead
+            // of O(whole buffer) — total O(buffer) rather than O(buffer²) over a
+            // long dictation session.
+            let frozen = frozenFrameCount()
+            if frozen > melComputedFrames {
+                var rows: [MLXArray] = []
+                rows.reserveCapacity(frozen - melComputedFrames)
+                for m in melComputedFrames..<frozen {
+                    rows.append(NemotronASRAudio.melFrame(
+                        preemphBuffer,
+                        frame: m,
+                        window: melWindow,
+                        filters: melFilters,
+                        config: config
+                    ))
+                }
+                let newMel = MLX.concatenated(rows, axis: 0)  // (K, F)
+                melAccum = melAccum == nil
+                    ? newMel
+                    : MLX.concatenated([melAccum!, newMel], axis: 0)
+                melComputedFrames = frozen
+            }
+            if let accum = melAccum {
+                model.streamEncodeChunks(
+                    accum,
+                    language: language,
+                    limit: accum.shape[1],
+                    chunkFrames: chunkFrames,
+                    flushTail: false,
+                    state: encState
+                ) { prompted in
+                    model.streamRNNTDecode(prompted, state: rnntState, frameSeconds: frameSeconds)
+                }
+            }
         }
 
         // Bound the lazy graph across steps: materialize the caches the next step
@@ -210,13 +288,26 @@ public final class NemotronASRStreamSession {
     /// bit-identical to the final offline mel regardless of future samples. The STFT
     /// centers with `nFft/2` zero-pad, so frame m is frozen iff m·hop + nFft/2 <=
     /// bufferLen. Conservative by construction: an under-count only delays a chunk
-    /// by one `step` (latency), never corrupts output.
-    private func frozenMelFrames(totalMel: Int) -> Int {
+    /// by one `step` (latency), never corrupts output. Matches the old
+    /// `frozenMelFrames(min(totalMel, largestFrozen+1))` result exactly: here the
+    /// buffer-derived count is always the smaller bound.
+    private func frozenFrameCount() -> Int {
         let hop = model.preprocessConfig.hopLength
         let half = model.preprocessConfig.nFft / 2
         guard rawBuffer.count >= half else { return 0 }
-        let largestFrozen = (rawBuffer.count - half) / hop
-        return min(totalMel, largestFrozen + 1)
+        return (rawBuffer.count - half) / hop + 1
+    }
+
+    /// Pre-emphasize newly arrived samples (causal: y[i] = x[i] − preemph·x[i−1],
+    /// y[0] = x[0]), appending to the incremental-mel signal buffer.
+    private func appendPreemph(_ samples: [Float]) {
+        let preemph = Float(model.preprocessConfig.preemph)
+        for s in samples {
+            let p = hasPreemphContext ? s - preemph * lastRawSample : s
+            preemphBuffer.append(p)
+            lastRawSample = s
+            hasPreemphContext = true
+        }
     }
 }
 
