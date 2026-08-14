@@ -238,28 +238,36 @@ public final class NemotronASRStreamSession {
             // long dictation session.
             let frozen = frozenFrameCount()
             if frozen > melComputedFrames {
-                var rows: [MLXArray] = []
-                rows.reserveCapacity(frozen - melComputedFrames)
-                for m in melComputedFrames..<frozen {
-                    rows.append(NemotronASRAudio.melFrame(
-                        preemphBuffer,
-                        frame: m,
-                        window: melWindow,
-                        filters: melFilters,
-                        config: config
-                    ))
-                }
-                let newMel = MLX.concatenated(rows, axis: 0)  // (K, F)
+                let newMel = NemotronASRAudio.melFrames(
+                    preemphBuffer,
+                    frames: melComputedFrames..<frozen,
+                    window: melWindow,
+                    filters: melFilters,
+                    config: config
+                )  // (K, F)
                 melAccum = melAccum == nil
                     ? newMel
                     : MLX.concatenated([melAccum!, newMel], axis: 0)
                 melComputedFrames = frozen
             }
             if let accum = melAccum {
+                // limit is the MEL FRAME count (accum.shape[0]); shape[1] is the
+                // feature dim — passing it here silently froze the encoder at
+                // `consumed < F` and stalled decoding after two chunks (the
+                // incremental-mel integration caught this, not the unit suite).
+                //
+                // Numerics note: the incremental frames are NOT bit-identical to
+                // the offline mel. MLX's rfft is batch-count-dependent in the
+                // last ulp, so any incremental batch (necessarily a different
+                // count than the whole-buffer mel) carries ~1e-4 float32 (~1
+                // float16 ulp) noise per frame — the offline mel's OWN frames
+                // drift the same way as the buffer grows. Transcripts are
+                // near-identical (structure + most tokens on real speech); the
+                // live speechd lane is the arbiter for WER equivalence.
                 model.streamEncodeChunks(
                     accum,
                     language: language,
-                    limit: accum.shape[1],
+                    limit: accum.shape[0],
                     chunkFrames: chunkFrames,
                     flushTail: false,
                     state: encState
