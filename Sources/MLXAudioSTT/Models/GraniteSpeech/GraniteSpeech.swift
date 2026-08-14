@@ -789,6 +789,18 @@ public class GraniteSpeechModel: Module {
 
     // MARK: - Prompt Building
 
+    /// Resolve the transcription/translation prompt the way `generate` does: an
+    /// explicit `prompt` wins; otherwise a `language` (code or name) becomes a
+    /// "Translate the speech to <lang>." instruction; otherwise nil falls back to
+    /// `buildPrompt`'s default transcription prompt. Single source of truth for the
+    /// offline and streaming paths so they agree bit-for-bit.
+    func resolveUserPrompt(prompt: String?, language: String?) -> String? {
+        if let prompt { return prompt }
+        guard let language else { return nil }
+        let langName = languageCodes[language.lowercased()] ?? language
+        return "Translate the speech to \(langName)."
+    }
+
     func buildPrompt(numAudioTokens: Int, userPrompt: String?) -> MLXArray {
         guard let tokenizer else { fatalError("Tokenizer not loaded") }
 
@@ -858,11 +870,7 @@ public class GraniteSpeechModel: Module {
     ) -> STTOutput {
         guard let tokenizer else { fatalError("Tokenizer not loaded") }
 
-        var userPrompt = prompt
-        if userPrompt == nil, let language {
-            let langName = languageCodes[language.lowercased()] ?? language
-            userPrompt = "Translate the speech to \(langName)."
-        }
+        let userPrompt = resolveUserPrompt(prompt: prompt, language: language)
 
         let startTime = Date()
 
@@ -939,11 +947,7 @@ public class GraniteSpeechModel: Module {
                     throw STTError.modelNotInitialized("Tokenizer not loaded")
                 }
 
-                var userPrompt = prompt
-                if userPrompt == nil, let language {
-                    let langName = languageCodes[language.lowercased()] ?? language
-                    userPrompt = "Translate the speech to \(langName)."
-                }
+                let userPrompt = resolveUserPrompt(prompt: prompt, language: language)
 
                 let startTime = Date()
 
@@ -1024,6 +1028,62 @@ public class GraniteSpeechModel: Module {
                 continuation.finish(throwing: error)
             }
         }
+    }
+
+    // MARK: - Offline Transcribe (shared by generate + streaming session)
+
+    /// Run the complete offline pipeline — mel → conformer → QFormer → Granite LLM
+    /// prefill + greedy decode — on a raw audio buffer and return the transcript.
+    /// This is the exact sequence `generate` / `generateStream` walk, extracted so the
+    /// streaming session can reuse it: `GraniteSpeechStreamSession.finish()` calls this
+    /// with the full buffer, which makes the final streaming transcript bit-identical
+    /// to `generate(wholeAudio)`. Intermediate calls (partial buffer) are best-effort
+    /// decodes — see `GraniteSpeechStreamSession.swift` for the exact/approximate split.
+    func transcribeOffline(
+        audio: MLXArray,
+        maxTokens: Int = 4096,
+        temperature: Float = 0.0,
+        userPrompt: String?
+    ) -> (text: String, tokenIds: [Int], promptTokenCount: Int) {
+        guard let tokenizer else { fatalError("Tokenizer not loaded") }
+
+        let (inputFeatures, numAudioTokens) = extractFeatures(audio)
+        let audioFeatures = getAudioFeatures(inputFeatures)
+        eval(audioFeatures)
+
+        let promptIds = buildPrompt(numAudioTokens: numAudioTokens, userPrompt: userPrompt)
+        let inputsEmbeds = buildInputEmbeds(promptIds, audioFeatures: audioFeatures)
+        eval(inputsEmbeds)
+
+        let promptTokenCount = promptIds.dim(0)
+        let cache = makeCache()
+        let logits = languageModel(cache: cache, inputEmbeddings: inputsEmbeds)
+        eval(logits)
+
+        var ctx = GenerationContext(
+            tokenizer: tokenizer,
+            cache: cache,
+            eosTokenId: tokenizer.eosTokenId ?? 0,
+            logits: logits
+        )
+
+        var generatedTokens: [Int] = []
+        for _ in 0..<maxTokens {
+            let nextToken = ctx.sampleNextToken(temperature: temperature)
+            if ctx.isEOS(nextToken) { break }
+            generatedTokens.append(nextToken)
+
+            let nextTokenArray = MLXArray([Int32(nextToken)]).expandedDimensions(axis: 0)
+            let newLogits = languageModel(inputs: nextTokenArray, cache: cache)
+            eval(newLogits)
+            ctx = GenerationContext(
+                tokenizer: tokenizer, cache: cache,
+                eosTokenId: ctx.eosTokenId, logits: newLogits
+            )
+        }
+
+        let text = ctx.decode(generatedTokens).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (text: text, tokenIds: generatedTokens, promptTokenCount: promptTokenCount)
     }
 
     // MARK: - Cache
