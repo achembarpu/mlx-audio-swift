@@ -10,6 +10,27 @@ struct GraniteSpeechStreamingTests {
         #expect(
             GraniteSpeechStreamSession.shouldDecodeIntermediate(mode: .growingWindow) == true
         )
+        #expect(
+            GraniteSpeechStreamSession.shouldEmitSnapshots(mode: .revisableOverlay) == true
+        )
+        #expect(
+            GraniteSpeechStreamSession.shouldEmitSnapshots(mode: .finalOnly) == false
+        )
+    }
+
+    @Test func revisableOverlayKeepsTheLatestFullText() {
+        #expect(
+            GraniteSpeechStreamSession.snapshotText(
+                previous: "hello world",
+                latest: "hello"
+            ) == "hello"
+        )
+        #expect(
+            GraniteSpeechStreamSession.snapshotText(
+                previous: "hello",
+                latest: "hello world"
+            ) == "hello world"
+        )
     }
 
     @Test func shorterReDecodeDoesNotEmitARewriteOrTrap() {
