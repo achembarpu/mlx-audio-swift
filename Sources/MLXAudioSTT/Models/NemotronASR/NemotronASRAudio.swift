@@ -186,6 +186,8 @@ extension NemotronASRAudio {
         let fft = MLXFFT.rfft(windowed.expandedDimensions(axis: 0), axis: 1)
         let power = MLX.abs(fft).square()
         let mel = MLX.matmul(power, filters.asType(power.dtype))
-        return MLX.log(mel + MLXArray(config.logZeroGuardValue, dtype: mel.dtype))[0]
+        // Keep the leading batch axis: the caller concatenates rows along axis 0
+        // into a (T, F) mel, so each row must be [1, F], not a 1-D [F].
+        return MLX.log(mel + MLXArray(config.logZeroGuardValue, dtype: mel.dtype))
     }
 }
