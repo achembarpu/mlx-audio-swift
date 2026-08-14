@@ -120,6 +120,19 @@ public final class GraniteSpeechStreamSession {
         mode != .finalOnly
     }
 
+    /// Decide whether the current audio window should run inference. This pure
+    /// gate keeps the cadence policy testable without constructing a model and
+    /// ensures `finish()` always flushes the trailing window.
+    static func shouldDecode(
+        mode: GraniteSpeechStreamingMode,
+        isFinal: Bool,
+        numAudioTokens: Int,
+        lastNumAudioTokens: Int
+    ) -> Bool {
+        guard isFinal || shouldDecodeIntermediate(mode: mode) else { return false }
+        return isFinal || numAudioTokens > lastNumAudioTokens
+    }
+
     /// Whether each decoded window is delivered as a complete replacement
     /// snapshot instead of an append-only suffix.
     static func shouldEmitSnapshots(mode: GraniteSpeechStreamingMode) -> Bool {
@@ -191,16 +204,22 @@ public final class GraniteSpeechStreamSession {
         let audio = MLXArray(rawBuffer)
 
         // Decode only when a new audio-token window has completed (or on finish). The
-        // window gate is what bounds the re-decode cadence to ~300 ms; extractFeatures is
-        // the cheap mel front end, so running it just for the token count is negligible.
-        let (_, numAudioTokens) = model.extractFeatures(audio)
-        guard final || numAudioTokens > lastNumAudioTokens else {
+        // same feature extraction supplies both the gate and the offline pipeline;
+        // this avoids recomputing the global mel normalization for every decode.
+        let (inputFeatures, numAudioTokens) = model.extractFeatures(audio)
+        guard Self.shouldDecode(
+            mode: mode,
+            isFinal: final,
+            numAudioTokens: numAudioTokens,
+            lastNumAudioTokens: lastNumAudioTokens
+        ) else {
             return Delta(text: "", tokenIds: [])
         }
         lastNumAudioTokens = numAudioTokens
 
         let result = model.transcribeOffline(
-            audio: audio,
+            inputFeatures: inputFeatures,
+            numAudioTokens: numAudioTokens,
             maxTokens: maxTokens,
             temperature: temperature,
             userPrompt: userPrompt

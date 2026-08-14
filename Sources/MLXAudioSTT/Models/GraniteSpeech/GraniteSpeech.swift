@@ -1045,9 +1045,29 @@ public class GraniteSpeechModel: Module {
         temperature: Float = 0.0,
         userPrompt: String?
     ) -> (text: String, tokenIds: [Int], promptTokenCount: Int) {
+        let (inputFeatures, numAudioTokens) = extractFeatures(audio)
+        return transcribeOffline(
+            inputFeatures: inputFeatures,
+            numAudioTokens: numAudioTokens,
+            maxTokens: maxTokens,
+            temperature: temperature,
+            userPrompt: userPrompt
+        )
+    }
+
+    /// Run the offline decoder using features already extracted by a streaming
+    /// window gate. Keeping this overload internal prevents callers from needing
+    /// to understand Granite's feature/token alignment while allowing streaming
+    /// sessions to avoid extracting the same mel features twice.
+    func transcribeOffline(
+        inputFeatures: MLXArray,
+        numAudioTokens: Int,
+        maxTokens: Int = 4096,
+        temperature: Float = 0.0,
+        userPrompt: String?
+    ) -> (text: String, tokenIds: [Int], promptTokenCount: Int) {
         guard let tokenizer else { fatalError("Tokenizer not loaded") }
 
-        let (inputFeatures, numAudioTokens) = extractFeatures(audio)
         let audioFeatures = getAudioFeatures(inputFeatures)
         eval(audioFeatures)
 
