@@ -29,7 +29,42 @@ struct GraniteSpeechStreamingTests {
             GraniteSpeechStreamSession.snapshotText(
                 previous: "hello",
                 latest: "hello world"
-            ) == "hello world"
+        ) == "hello world"
+        )
+    }
+
+    @Test func decodeGatePreservesWindowCadenceAndFinalFlush() {
+        #expect(
+            GraniteSpeechStreamSession.shouldDecode(
+                mode: .revisableOverlay,
+                isFinal: false,
+                numAudioTokens: 3,
+                lastNumAudioTokens: 3
+            ) == false
+        )
+        #expect(
+            GraniteSpeechStreamSession.shouldDecode(
+                mode: .revisableOverlay,
+                isFinal: false,
+                numAudioTokens: 4,
+                lastNumAudioTokens: 3
+            ) == true
+        )
+        #expect(
+            GraniteSpeechStreamSession.shouldDecode(
+                mode: .finalOnly,
+                isFinal: false,
+                numAudioTokens: 99,
+                lastNumAudioTokens: 0
+            ) == false
+        )
+        #expect(
+            GraniteSpeechStreamSession.shouldDecode(
+                mode: .finalOnly,
+                isFinal: true,
+                numAudioTokens: 1,
+                lastNumAudioTokens: 1
+            ) == true
         )
     }
 
