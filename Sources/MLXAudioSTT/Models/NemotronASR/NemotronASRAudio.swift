@@ -61,7 +61,7 @@ enum NemotronASRAudio {
         return mel.expandedDimensions(axis: 0).asType(originalDType)
     }
 
-    private static func makeWindow(name: String, winLength: Int, fftLength: Int) -> MLXArray {
+    static func makeWindow(name: String, winLength: Int, fftLength: Int) -> MLXArray {
         let base: MLXArray
         switch name.lowercased() {
         case "hann", "hanning":
@@ -121,5 +121,71 @@ enum NemotronASRAudio {
             Float(1) - abs((Float(n) - mid) / mid)
         }
         return MLXArray(values)
+    }
+}
+
+// MARK: - Incremental (online) mel
+
+extension NemotronASRAudio {
+    /// Static window / mel-filterbank for a preprocess config, reused across the
+    /// per-frame incremental computation below (computed once per session).
+    static func melWindow(_ config: NemotronASRPreprocessConfig) -> MLXArray {
+        makeWindow(name: config.window, winLength: config.winLength, fftLength: config.nFft)
+    }
+
+    static func melFilterbank(_ config: NemotronASRPreprocessConfig) -> MLXArray {
+        melFilters(
+            sampleRate: config.sampleRate,
+            nFft: config.nFft,
+            nMels: config.features,
+            norm: "slaney",
+            melScale: .slaney
+        )
+    }
+
+    /// Compute the mel row for one absolute frame index of a growing
+    /// pre-emphasized signal, bit-identical to `logMelSpectrogram(...)[0, frame]`.
+    ///
+    /// `logMelSpectrogram` zero-pads the signal with `nFft/2` on both ends and
+    /// frames it at `hop` (strided view), so frame `f` is a function of the
+    /// samples `[f·hop − nFft/2, f·hop + nFft/2)` (zero outside the signal). Once
+    /// `f·hop + nFft/2 <= samples.count`, the frame is FROZEN — unaffected by any
+    /// future audio — so it can be computed here and cached. This is what lets
+    /// `NemotronASRStreamSession` avoid recomputing the whole mel on every step
+    /// (O(buffer²) total) and instead pay O(buffer) overall.
+    static func melFrame(
+        _ preemphSignal: [Float],
+        frame: Int,
+        window: MLXArray,
+        filters: MLXArray,
+        config: NemotronASRPreprocessConfig
+    ) -> MLXArray {
+        let nFft = config.nFft
+        let hop = config.hopLength
+        let half = nFft / 2
+        let start = frame * hop - half
+        let end = start + nFft
+
+        // padded[f·hop ...] == signal window with nFft/2 zero-pad at both edges.
+        var samples: [Float] = []
+        samples.reserveCapacity(nFft)
+        if start < 0 {
+            samples.append(contentsOf: [Float](repeating: 0, count: -start))
+        }
+        let lo = max(0, start)
+        let hi = min(preemphSignal.count, end)
+        if lo < hi {
+            samples.append(contentsOf: preemphSignal[lo..<hi])
+        }
+        if end > preemphSignal.count {
+            samples.append(contentsOf: [Float](repeating: 0, count: end - preemphSignal.count))
+        }
+
+        let x = MLXArray(samples).asType(.float32)
+        let windowed = x * window.asType(.float32)
+        let fft = MLXFFT.rfft(windowed.expandedDimensions(axis: 0), axis: 1)
+        let power = MLX.abs(fft).square()
+        let mel = MLX.matmul(power, filters.asType(power.dtype))
+        return MLX.log(mel + MLXArray(config.logZeroGuardValue, dtype: mel.dtype))[0]
     }
 }
