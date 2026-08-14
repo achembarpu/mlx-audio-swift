@@ -971,6 +971,13 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
 
     private let shared = OSAllocatedUnfairLock(initialState: SessionSharedState())
     private let sessionLock = OSAllocatedUnfairLock(initialState: 0)
+    /// MLX model/module state is not safe to use concurrently.  In particular,
+    /// `feedAudio` runs the encoder synchronously while a previous decode pass
+    /// is detached, so the state must be ordered across both paths.
+    private let inferenceQueue = DispatchQueue(
+        label: "MLXAudioSTT.QwenStreamingInference",
+        qos: .userInitiated
+    )
 
     private var isActive: Bool = false
     private var totalSamplesFed: Int = 0
@@ -1009,7 +1016,8 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
     }
 
     func feedAudio(samples: [Float]) {
-        sessionLock.withLock { _ in
+        inferenceQueue.sync {
+            sessionLock.withLock { _ in
             guard isActive else { return }
 
             totalSamplesFed += samples.count
@@ -1068,6 +1076,7 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
                     launchDecodePassLocked()
                 }
             }
+            }
         }
     }
 
@@ -1115,16 +1124,19 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
                 let continuation = self.continuation
                 let sharedState = self.shared
 
+                let inferenceQueue = self.inferenceQueue
                 decodeTask = Task.detached {
-                    defer {
-                        sharedState.withLock { $0.isDecoding = false }
-                    }
+                    inferenceQueue.sync {
+                        defer {
+                            sharedState.withLock { $0.isDecoding = false }
+                        }
 
-                    Self.runFinalizeCompletedWindows(
-                        params: params,
-                        continuation: continuation,
-                        sharedState: sharedState
-                    )
+                        Self.runFinalizeCompletedWindows(
+                            params: params,
+                            continuation: continuation,
+                            sharedState: sharedState
+                        )
+                    }
                 }
                 return
             }
@@ -1173,18 +1185,21 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
         let totalSamples = totalSamplesFed
         let encodedWindowCount = encoder.encodedWindowCount
 
+        let inferenceQueue = self.inferenceQueue
         decodeTask = Task.detached {
-            defer {
-                sharedState.withLock { $0.isDecoding = false }
-            }
+            inferenceQueue.sync {
+                defer {
+                    sharedState.withLock { $0.isDecoding = false }
+                }
 
-            Self.runDecodePass(
-                params: params,
-                continuation: continuation,
-                sharedState: sharedState,
-                totalSamples: totalSamples,
-                encodedWindowCount: encodedWindowCount
-            )
+                Self.runDecodePass(
+                    params: params,
+                    continuation: continuation,
+                    sharedState: sharedState,
+                    totalSamples: totalSamples,
+                    encodedWindowCount: encodedWindowCount
+                )
+            }
         }
     }
 
@@ -1647,7 +1662,8 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
             return
         }
 
-        let snapshot: StopSnapshot = sessionLock.withLock { _ in
+        let snapshot: StopSnapshot = inferenceQueue.sync {
+            sessionLock.withLock { _ in
             if let melFrames = melProcessor.flush() {
                 _ = encoder.feed(melFrames: melFrames)
             }
@@ -1704,6 +1720,7 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
                 encodedWindowCount: encodedWindowCount,
                 fallbackFinalText: fallbackFinalText
             )
+            }
         }
 
         if Task.isCancelled {
@@ -1718,12 +1735,14 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
                 if Task.isCancelled { return }
 
                 if audioFeatures.dim(0) <= 0 { continue }
-                let tokenIds = Self.decodeAllTokenIds(
-                    model: model,
-                    audioFeatures: audioFeatures,
-                    confirmedCount: 0,
-                    config: config
-                )
+                let tokenIds = inferenceQueue.sync {
+                    Self.decodeAllTokenIds(
+                        model: model,
+                        audioFeatures: audioFeatures,
+                        confirmedCount: 0,
+                        config: config
+                    )
+                }
                 if Task.isCancelled { return }
 
                 let windowText = tokenizer.decode(tokens: tokenIds)
@@ -1747,12 +1766,14 @@ private final class QwenStreamingInferenceSessionCore: @unchecked Sendable, Stre
            let tokenizer = model.tokenizer
         {
             let startTime = Date()
-            let tokenIds = Self.decodeAllTokenIds(
-                model: model,
-                audioFeatures: audioFeatures,
-                confirmedCount: snapshot.confirmedCount,
-                config: config
-            )
+            let tokenIds = inferenceQueue.sync {
+                Self.decodeAllTokenIds(
+                    model: model,
+                    audioFeatures: audioFeatures,
+                    confirmedCount: snapshot.confirmedCount,
+                    config: config
+                )
+            }
             if Task.isCancelled {
                 return
             }
