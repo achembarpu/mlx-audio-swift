@@ -40,8 +40,14 @@ final class NemotronASRStreamRNNTState {
     // changes, so a run of consecutive blanks can reuse the previous decode
     // instead of recomputing it per frame (each blank frame cost one LSTM
     // forward pass that changed nothing).
+    //
+    // The cached PROPOSED state matters as much as the cached prediction: on a
+    // reuse frame that EMITS a symbol, the decoder must advance by the state
+    // that produced the cached prediction, not by the (unchanged) live state —
+    // the live `decoderState` lags one token behind the cached decode.
     var cachedLastToken: Int?
     var cachedPred: MLXArray?
+    var cachedProposedState: NemoLSTMState?
 
     init(blankToken: Int) { lastToken = blankToken }
 }
@@ -67,12 +73,12 @@ extension NemotronASRModel {
             // Reuse the prediction output across consecutive unchanged frames.
             let pred: MLXArray
             let proposedState: NemoLSTMState
-            if state.cachedLastToken == state.lastToken, let cachedPred = state.cachedPred {
+            if state.cachedLastToken == state.lastToken,
+               let cachedPred = state.cachedPred,
+               let cachedProposed = state.cachedProposedState
+            {
                 pred = cachedPred
-                proposedState = (
-                    hidden: state.decoderState?.hidden,
-                    cell: state.decoderState?.cell
-                )
+                proposedState = cachedProposed
             } else {
                 let decoderOutput = decoder(currentToken, state: state.decoderState)
                 pred = decoderOutput.0.asType(frame.dtype)
@@ -82,6 +88,7 @@ extension NemotronASRModel {
                 )
                 state.cachedPred = pred
                 state.cachedLastToken = state.lastToken
+                state.cachedProposedState = proposedState
             }
             let jointOutput = joint(frame, pred)
             let token = jointOutput.argMax(axis: -1).item(Int.self)
