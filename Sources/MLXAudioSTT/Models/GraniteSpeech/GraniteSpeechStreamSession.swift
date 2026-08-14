@@ -98,6 +98,22 @@ public final class GraniteSpeechStreamSession {
     /// Whether `finish()` has been called.
     public var isFinished: Bool { done }
 
+    /// Returns a suffix only when the latest decode preserves the already-emitted
+    /// transcript. A growing-window re-decode can temporarily shorten or rewrite
+    /// its result; the insertion contract is append-only, so those snapshots must
+    /// be held back rather than emitted as a duplicate or rewrite.
+    static func appendOnlyTextDelta(previous: String, latest: String) -> String {
+        guard latest.hasPrefix(previous) else { return "" }
+        return String(latest.dropFirst(previous.count))
+    }
+
+    /// Returns token IDs beyond the previously emitted prefix. Re-decodes are
+    /// allowed to return fewer IDs than an earlier pass, so slicing is guarded.
+    static func appendOnlyTokenDelta(previousCount: Int, latest: [Int]) -> [Int] {
+        guard previousCount >= 0, latest.count >= previousCount else { return [] }
+        return Array(latest.dropFirst(previousCount))
+    }
+
     /// Ingest a chunk of 16 kHz mono samples; returns the text decoded by this call
     /// (usually empty until a new audio-token window completes).
     @discardableResult
@@ -146,12 +162,15 @@ public final class GraniteSpeechStreamSession {
         )
 
         let fullText = result.text
-        let deltaText = fullText.hasPrefix(emittedText)
-            ? String(fullText.dropFirst(emittedText.count))
-            : fullText
-        emittedText = fullText
+        let deltaText = Self.appendOnlyTextDelta(previous: emittedText, latest: fullText)
+        if !deltaText.isEmpty || fullText == emittedText {
+            emittedText = fullText
+        }
         tokenIds = result.tokenIds
-        let deltaIds = Array(result.tokenIds[firstNew...])
+        let deltaIds = Self.appendOnlyTokenDelta(
+            previousCount: firstNew,
+            latest: result.tokenIds
+        )
 
         if final { done = true }
         Memory.clearCache()
