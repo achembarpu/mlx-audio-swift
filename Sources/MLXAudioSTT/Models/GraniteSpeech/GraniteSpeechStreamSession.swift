@@ -60,6 +60,17 @@ import MLX
 // growing prefix, so re-decode (or a speculative-carry scheme) is required regardless. That
 // is a larger change with its own WER/bit-exactness risks, so it is left out of this pass.
 
+/// Controls whether a Granite session exposes provisional transcript snapshots.
+///
+/// Granite is an offline architecture: growing-window re-decodes can revise text
+/// already returned by an earlier window. `finalOnly` is therefore the safe default
+/// for append-only consumers. `growingWindow` is retained for callers that can
+/// handle replacement semantics themselves.
+public enum GraniteSpeechStreamingMode: Sendable, Equatable {
+    case finalOnly
+    case growingWindow
+}
+
 public final class GraniteSpeechStreamSession {
     /// Text + token ids decoded by a single `step` / `finish` call.
     public struct Delta {
@@ -71,6 +82,7 @@ public final class GraniteSpeechStreamSession {
     private let userPrompt: String?
     private let maxTokens: Int
     private let temperature: Float
+    private let mode: GraniteSpeechStreamingMode
 
     private var rawBuffer: [Float] = []
     private var emittedText = ""
@@ -82,12 +94,14 @@ public final class GraniteSpeechStreamSession {
         model: GraniteSpeechModel,
         userPrompt: String?,
         maxTokens: Int,
-        temperature: Float
+        temperature: Float,
+        mode: GraniteSpeechStreamingMode
     ) {
         self.model = model
         self.userPrompt = userPrompt
         self.maxTokens = maxTokens
         self.temperature = temperature
+        self.mode = mode
     }
 
     /// Full transcript decoded so far (the server's append-only emitter consumes this
@@ -97,6 +111,11 @@ public final class GraniteSpeechStreamSession {
     public var tokens: [Int] { tokenIds }
     /// Whether `finish()` has been called.
     public var isFinished: Bool { done }
+
+    /// Whether a non-final audio chunk may trigger model inference.
+    static func shouldDecodeIntermediate(mode: GraniteSpeechStreamingMode) -> Bool {
+        mode == .growingWindow
+    }
 
     /// Returns a suffix only when the latest decode preserves the already-emitted
     /// transcript. A growing-window re-decode can temporarily shorten or rewrite
@@ -139,6 +158,16 @@ public final class GraniteSpeechStreamSession {
         guard !done else { return Delta(text: "", tokenIds: []) }
         guard !rawBuffer.isEmpty else {
             if final { done = true }
+            return Delta(text: "", tokenIds: [])
+        }
+
+        // No intermediate result can be made append-only-safe for Granite: the
+        // global mel normalization, right-edge convolution, and audio-before-text
+        // prompt can all revise an earlier decode. In finalOnly mode, defer all
+        // inference until finish(), preserving both correctness and O(1) interim
+        // CPU/GPU work. `growingWindow` remains an explicit opt-in for replacement-
+        // capable consumers.
+        guard final || Self.shouldDecodeIntermediate(mode: mode) else {
             return Delta(text: "", tokenIds: [])
         }
 
@@ -190,13 +219,15 @@ public extension GraniteSpeechModel {
         prompt: String? = nil,
         language: String? = nil,
         maxTokens: Int = 4096,
-        temperature: Float = 0.0
+        temperature: Float = 0.0,
+        mode: GraniteSpeechStreamingMode = .finalOnly
     ) -> GraniteSpeechStreamSession {
         GraniteSpeechStreamSession(
             model: self,
             userPrompt: resolveUserPrompt(prompt: prompt, language: language),
             maxTokens: maxTokens,
-            temperature: temperature
+            temperature: temperature,
+            mode: mode
         )
     }
 
@@ -209,7 +240,8 @@ public extension GraniteSpeechModel {
         audio: MLXArray,
         generationParameters: STTGenerateParameters = STTGenerateParameters(),
         chunkMs: Int = 480,
-        onDelta: ((String) -> Void)? = nil
+        onDelta: ((String) -> Void)? = nil,
+        mode: GraniteSpeechStreamingMode = .finalOnly
     ) -> STTOutput {
         let mono = audio.ndim > 1 ? audio.mean(axis: -1) : audio
         let samples = mono.asType(.float32).asArray(Float.self)
@@ -218,7 +250,8 @@ public extension GraniteSpeechModel {
         let session = makeStreamSession(
             language: generationParameters.language,
             maxTokens: generationParameters.maxTokens,
-            temperature: generationParameters.temperature
+            temperature: generationParameters.temperature,
+            mode: mode
         )
         let start = CFAbsoluteTimeGetCurrent()
 

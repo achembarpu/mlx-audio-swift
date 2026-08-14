@@ -3,6 +3,15 @@ import Testing
 @testable import MLXAudioSTT
 
 struct GraniteSpeechStreamingTests {
+    @Test func finalOnlyModeDefersInferenceUntilFinish() {
+        #expect(
+            GraniteSpeechStreamSession.shouldDecodeIntermediate(mode: .finalOnly) == false
+        )
+        #expect(
+            GraniteSpeechStreamSession.shouldDecodeIntermediate(mode: .growingWindow) == true
+        )
+    }
+
     @Test func shorterReDecodeDoesNotEmitARewriteOrTrap() {
         let priorText = "hello world"
         let priorTokenCount = 3
