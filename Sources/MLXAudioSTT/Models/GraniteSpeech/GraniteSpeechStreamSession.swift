@@ -64,11 +64,14 @@ import MLX
 ///
 /// Granite is an offline architecture: growing-window re-decodes can revise text
 /// already returned by an earlier window. `finalOnly` is therefore the safe default
-/// for append-only consumers. `growingWindow` is retained for callers that can
-/// handle replacement semantics themselves.
+/// for append-only consumers. `revisableOverlay` is for callers that can replace
+/// the visible transcript snapshot when a growing-window decode revises it.
+/// `growingWindow` remains available for source compatibility and retains its
+/// historical append-only delta behavior.
 public enum GraniteSpeechStreamingMode: Sendable, Equatable {
     case finalOnly
     case growingWindow
+    case revisableOverlay
 }
 
 public final class GraniteSpeechStreamSession {
@@ -114,7 +117,20 @@ public final class GraniteSpeechStreamSession {
 
     /// Whether a non-final audio chunk may trigger model inference.
     static func shouldDecodeIntermediate(mode: GraniteSpeechStreamingMode) -> Bool {
-        mode == .growingWindow
+        mode != .finalOnly
+    }
+
+    /// Whether each decoded window is delivered as a complete replacement
+    /// snapshot instead of an append-only suffix.
+    static func shouldEmitSnapshots(mode: GraniteSpeechStreamingMode) -> Bool {
+        mode == .revisableOverlay
+    }
+
+    /// Returns the latest transcript for replacement-capable consumers. Keeping
+    /// this operation explicit makes the delivery contract independent of the
+    /// model's prefix-deduplication strategy.
+    static func snapshotText(previous: String, latest: String) -> String {
+        latest
     }
 
     /// Returns a suffix only when the latest decode preserves the already-emitted
@@ -191,15 +207,22 @@ public final class GraniteSpeechStreamSession {
         )
 
         let fullText = result.text
-        let deltaText = Self.appendOnlyTextDelta(previous: emittedText, latest: fullText)
-        if !deltaText.isEmpty || fullText == emittedText {
+        let emitsSnapshot = Self.shouldEmitSnapshots(mode: mode)
+        let changed = fullText != emittedText
+        let deltaText: String
+        if emitsSnapshot {
+            deltaText = changed ? Self.snapshotText(previous: emittedText, latest: fullText) : ""
+            emittedText = fullText
+        } else {
+            deltaText = Self.appendOnlyTextDelta(previous: emittedText, latest: fullText)
+        }
+        if !emitsSnapshot && (!deltaText.isEmpty || fullText == emittedText) {
             emittedText = fullText
         }
         tokenIds = result.tokenIds
-        let deltaIds = Self.appendOnlyTokenDelta(
-            previousCount: firstNew,
-            latest: result.tokenIds
-        )
+        let deltaIds = emitsSnapshot
+            ? (changed ? result.tokenIds : [])
+            : Self.appendOnlyTokenDelta(previousCount: firstNew, latest: result.tokenIds)
 
         if final { done = true }
         Memory.clearCache()
@@ -215,6 +238,10 @@ public extension GraniteSpeechModel {
     ///   - language: language code/name (e.g. "fr") for speech translation; `nil` for
     ///     transcription. Same resolution as `generate`.
     ///   - maxTokens / temperature: forwarded to the greedy decode, matching `generate`.
+    ///   - mode: `.finalOnly` defers model work until `finish()`. `.revisableOverlay`
+    ///     decodes completed windows and returns the latest full transcript in each
+    ///     `Delta`, which is suitable for a UI that can replace its visible buffer.
+    ///     `.growingWindow` retains the legacy append-only suffix behavior.
     func makeStreamSession(
         prompt: String? = nil,
         language: String? = nil,
@@ -233,8 +260,9 @@ public extension GraniteSpeechModel {
 
     /// Transcribe a whole audio buffer through the online streaming session, feeding
     /// fixed `chunkMs`-sized chunks as a live caller would — instead of the whole-buffer
-    /// `generateStream`. `onDelta` receives each newly decoded fragment as it is produced
-    /// (use it to render live output); the returned `STTOutput` is the full transcript
+    /// `generateStream`. `onDelta` receives each newly decoded fragment, or each changed
+    /// full snapshot when `mode` is `.revisableOverlay`, as it is produced (use it to
+    /// render live output); the returned `STTOutput` is the full transcript
     /// (bit-identical to `generate(audio:)` because the session's `finish()` is exact).
     func transcribeStreaming(
         audio: MLXArray,
