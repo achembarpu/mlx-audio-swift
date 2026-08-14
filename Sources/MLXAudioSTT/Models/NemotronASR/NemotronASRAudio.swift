@@ -143,19 +143,24 @@ extension NemotronASRAudio {
         )
     }
 
-    /// Compute the mel row for one absolute frame index of a growing
-    /// pre-emphasized signal, bit-identical to `logMelSpectrogram(...)[0, frame]`.
+    /// Compute the mel rows for a contiguous range of absolute frame indices of a
+    /// growing pre-emphasized signal, matching `logMelSpectrogram(...)[0, range]`
+    /// within the last ulp (see the numerics note in `NemotronASRStreamSession`).
     ///
     /// `logMelSpectrogram` zero-pads the signal with `nFft/2` on both ends and
-    /// frames it at `hop` (strided view), so frame `f` is a function of the
-    /// samples `[f·hop − nFft/2, f·hop + nFft/2)` (zero outside the signal). Once
-    /// `f·hop + nFft/2 <= samples.count`, the frame is FROZEN — unaffected by any
-    /// future audio — so it can be computed here and cached. This is what lets
-    /// `NemotronASRStreamSession` avoid recomputing the whole mel on every step
-    /// (O(buffer²) total) and instead pay O(buffer) overall.
-    static func melFrame(
+    /// frames it at `hop` via a strided view (`asStrided`), so frame `f` is a
+    /// function of the samples `[f·hop − nFft/2, f·hop + nFft/2)` (zero outside
+    /// the signal). Once `f·hop + nFft/2 <= samples.count`, the frame is FROZEN —
+    /// unaffected by any future audio — so it can be computed here and cached.
+    /// This is what lets `NemotronASRStreamSession` avoid recomputing the whole
+    /// mel on every step (O(buffer²) total) and instead pay O(buffer) overall.
+    ///
+    /// The rows are built with the SAME `asStrided` view the offline path uses
+    /// (not a copied stack), keeping the numerics as close as the differing rfft
+    /// batch counts allow.
+    static func melFrames(
         _ preemphSignal: [Float],
-        frame: Int,
+        frames: Range<Int>,
         window: MLXArray,
         filters: MLXArray,
         config: NemotronASRPreprocessConfig
@@ -163,31 +168,38 @@ extension NemotronASRAudio {
         let nFft = config.nFft
         let hop = config.hopLength
         let half = nFft / 2
-        let start = frame * hop - half
-        let end = start + nFft
+        let m0 = frames.lowerBound
+        let count = frames.count
+        let N = preemphSignal.count
 
-        // padded[f·hop ...] == signal window with nFft/2 zero-pad at both edges.
+        // padded = [0 × half] ++ signal ++ [0 × half]; frame f == padded[f·hop ..< f·hop+nFft].
+        // Build the minimal padded slice [rowStart, hi) covering the new frames.
+        let rowStart = m0 * hop
+        let hi = (m0 + count - 1) * hop + nFft
+
         var samples: [Float] = []
-        samples.reserveCapacity(nFft)
-        if start < 0 {
-            samples.append(contentsOf: [Float](repeating: 0, count: -start))
+        samples.reserveCapacity(hi - rowStart)
+        // padded[i] == 0 for i < half and i >= half + N, else signal[i - half].
+        let frontZeros = max(0, min(half, hi) - rowStart)
+        if frontZeros > 0 {
+            samples.append(contentsOf: [Float](repeating: 0, count: frontZeros))
         }
-        let lo = max(0, start)
-        let hi = min(preemphSignal.count, end)
-        if lo < hi {
-            samples.append(contentsOf: preemphSignal[lo..<hi])
+        let preLo = max(0, rowStart - half)
+        let preHi = max(0, min(hi, half + N) - half)
+        if preLo < preHi {
+            samples.append(contentsOf: preemphSignal[preLo..<preHi])
         }
-        if end > preemphSignal.count {
-            samples.append(contentsOf: [Float](repeating: 0, count: end - preemphSignal.count))
+        let backZeros = max(0, hi - (half + N))
+        if backZeros > 0 {
+            samples.append(contentsOf: [Float](repeating: 0, count: backZeros))
         }
 
-        let x = MLXArray(samples).asType(.float32)
-        let windowed = x * window.asType(.float32)
-        let fft = MLXFFT.rfft(windowed.expandedDimensions(axis: 0), axis: 1)
-        let power = MLX.abs(fft).square()
+        let paddedSlice = MLXArray(samples).asType(.float32)
+        let framesStacked = asStrided(paddedSlice, [count, nFft], strides: [hop, 1], offset: 0)
+        let windowed = framesStacked * window.asType(.float32)
+        let fft = MLXFFT.rfft(windowed, axis: 1)
+        let power = MLX.abs(fft).square().asType(.float32)
         let mel = MLX.matmul(power, filters.asType(power.dtype))
-        // Keep the leading batch axis: the caller concatenates rows along axis 0
-        // into a (T, F) mel, so each row must be [1, F], not a 1-D [F].
         return MLX.log(mel + MLXArray(config.logZeroGuardValue, dtype: mel.dtype))
     }
 }
