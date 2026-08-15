@@ -98,6 +98,32 @@ struct VoxtralRealtimeStreamingFrontEndTests {
         #expect(Self.maxAbsDifference(offline, streamed) <= Self.melTolerance)
     }
 
+    /// The streaming path passes its session-cached Hann window into the spectral
+    /// tail. Keep an explicit-window equivalence check here so future refactors
+    /// cannot silently drop that optimization or change its numerical behavior.
+    @Test func cachedHannWindowMatchesMelColumnFallback() {
+        let filters = VoxtralRealtimeAudio.computeMelFilters().asType(.float32)
+        let frames = MLXArray((0..<800).map { i in
+            Float(sin(2 * .pi * 440 * Float(i) / 16_000))
+        }).reshaped([2, 400])
+        let cached = VoxtralRealtimeAudio.periodicHannWindow(size: 400)
+        let fallback = VoxtralRealtimeAudio.melColumns(
+            frames: frames,
+            melFilters: filters,
+            windowSize: 400,
+            globalLogMelMax: 1.5
+        )
+        let explicit = VoxtralRealtimeAudio.melColumns(
+            frames: frames,
+            melFilters: filters,
+            windowSize: 400,
+            globalLogMelMax: 1.5,
+            window: cached
+        )
+
+        #expect(Self.maxAbsDifference(fallback, explicit) <= 1e-6)
+    }
+
     @Test func melStreamEmitsOnlyCompletedWindows() {
         let filters = VoxtralRealtimeAudio.computeMelFilters().asType(.float32)
         var mel = VoxtralRealtimeMelStream(leftPadSamples: 1280, melFilters: filters)
